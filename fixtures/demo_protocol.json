@@ -1,0 +1,67 @@
+{
+  "protocol_id": "deepwater-reservoir-v1",
+  "version": 1,
+  "title": "深水油藏开发证据重复核验",
+  "task_family": "reservoir-evidence-assurance",
+  "seed": 20260921,
+  "bootstrap_samples": 500,
+  "strata": [
+    {
+      "key": "stable-production",
+      "label": "稳产井组",
+      "required_trials": 3
+    },
+    {
+      "key": "high-water-cut",
+      "label": "高含水井组",
+      "required_trials": 3
+    }
+  ],
+  "metrics": [
+    {
+      "key": "production_stable",
+      "label": "是否保持稳产",
+      "kind": "binary",
+      "unit": null,
+      "direction": "higher"
+    },
+    {
+      "key": "water_cut_percent",
+      "label": "含水率",
+      "kind": "continuous",
+      "unit": "h",
+      "direction": "lower"
+    },
+    {
+      "key": "intervention_count",
+      "label": "干预次数",
+      "kind": "count",
+      "unit": "count",
+      "direction": "lower"
+    }
+  ],
+  "stratum_weights": {
+    "stable-production": "0.4",
+    "high-water-cut": "0.6"
+  },
+  "admission_rules": [
+    {
+      "metric": "production_stable",
+      "statistic": "wilson_lower",
+      "operator": "gte",
+      "threshold": "0.29"
+    },
+    {
+      "metric": "water_cut_percent",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "65"
+    },
+    {
+      "metric": "intervention_count",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "1.2"
+    }
+  ]
+}
