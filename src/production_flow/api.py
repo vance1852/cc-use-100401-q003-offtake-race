@@ -76,7 +76,18 @@ class JsonApplication:
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
-                return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+                return Response(201, self.service.dispatch_transfer(
+                    actor,
+                    payload["transfer_id"],
+                    payload["nomination_id"],
+                    payload["lot_id"],
+                    int(payload["expected_revision"]),
+                    confirmation_key=(
+                        None
+                        if payload.get("confirmation_key") is None
+                        else str(payload["confirmation_key"])
+                    ),
+                ))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
@@ -87,7 +98,10 @@ class JsonApplication:
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if exc.details:
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

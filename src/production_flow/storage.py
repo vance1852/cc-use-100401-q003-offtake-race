@@ -180,6 +180,23 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS transfer_confirmations (
+    confirmation_key TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL,
+    transfer_id TEXT NOT NULL,
+    nomination_id TEXT NOT NULL,
+    nomination_revision INTEGER NOT NULL,
+    inventory_lot_id TEXT NOT NULL,
+    lot_revision INTEGER NOT NULL,
+    loaded_quota_units TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_confirmations_nomination
+ON transfer_confirmations(nomination_id);
+
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,

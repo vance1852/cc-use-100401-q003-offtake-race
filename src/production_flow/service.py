@@ -404,6 +404,19 @@ class SupplyService:
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
         return {"allocation_id": allocation_id, **result}
 
+    def _transfer_response(self, transfer: sqlite3.Row, transit_hours: int, confirmation_key: str | None) -> dict[str, Any]:
+        departed_at = transfer["departed_at"]
+        return {
+            "transfer_id": transfer["transfer_id"],
+            "nomination_id": transfer["nomination_id"],
+            "state": transfer["state"],
+            "inventory_lot_id": transfer["inventory_lot_id"],
+            "loaded_quota_units": transfer["loaded_quota_units"],
+            "expected_delivered_quota_units": transfer["expected_delivered_quota_units"],
+            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=transit_hours)),
+            "confirmation_key": confirmation_key,
+        }
+
     def dispatch_transfer(
         self,
         actor_id: str,
@@ -411,59 +424,226 @@ class SupplyService:
         nomination_id: str,
         lot_id: str,
         expected_revision: int,
+        confirmation_key: str | None = None,
     ) -> dict[str, Any]:
         self._require(actor_id, "transfer.write")
-        nomination = self.connection.execute(
-            "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id FROM nominations n "
-            "JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
-            (nomination_id,),
-        ).fetchone()
-        if nomination is None:
-            raise NotFound("外输申请不存在")
-        if nomination["state"] != "allocated" or nomination["revision"] != expected_revision:
-            raise InvalidState("外输申请不是当前可交付版本")
-        lot = self.connection.execute("SELECT * FROM inventory_lots WHERE lot_id=?", (lot_id,)).fetchone()
-        if lot is None:
-            raise NotFound("原油资源批次不存在")
-        allocated = Decimal(nomination["allocated_quota_units"])
-        available = Decimal(lot["available_quota_units"])
-        if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
-            raise Conflict("原油资源批次与生产输送通道起点或资源类型不匹配")
-        if available < allocated:
-            raise Conflict("处理额度库存不足以完成分配")
-        expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
-        departed_at = self._now()
-        with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE inventory_lots SET available_quota_units=?,revision=revision+1 WHERE lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
-            )
-            self.connection.execute(
-                "UPDATE nominations SET state='in_transit',revision=revision+1 WHERE nomination_id=? AND revision=?",
-                (nomination_id, expected_revision),
-            )
-            self.connection.execute(
-                "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_quota_units,"
-                "expected_delivered_quota_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    transfer_id,
-                    nomination_id,
-                    lot_id,
-                    decimal_text(allocated),
-                    decimal_text(expected_delivery),
-                    departed_at,
-                    actor_id,
-                    departed_at,
-                ),
-            )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
-        return {
+        request_body = {
             "transfer_id": transfer_id,
-            "state": "in_transit",
-            "loaded_quota_units": decimal_text(allocated),
-            "expected_delivered_quota_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
+            "nomination_id": nomination_id,
+            "lot_id": lot_id,
+            "expected_revision": int(expected_revision),
         }
+        request_sha256 = digest(request_body)
+        with transaction(self.connection, immediate=True):
+            # 同一事务内先查既有裁决：幂等键、转运编号、申请上的在途转运。
+            saved = None
+            if confirmation_key is not None:
+                saved = self.connection.execute(
+                    "SELECT * FROM transfer_confirmations WHERE confirmation_key=?",
+                    (confirmation_key,),
+                ).fetchone()
+            if saved is None:
+                saved = self.connection.execute(
+                    "SELECT * FROM transfer_confirmations WHERE transfer_id=?",
+                    (transfer_id,),
+                ).fetchone()
+
+            nomination = self.connection.execute(
+                "SELECT n.*,r.loss_basis_points,r.transit_hours,r.origin_id,r.product AS route_product "
+                "FROM nominations n JOIN routes r ON r.route_id=n.route_id WHERE n.nomination_id=?",
+                (nomination_id,),
+            ).fetchone()
+            bound = self.connection.execute(
+                "SELECT * FROM transfers WHERE nomination_id=?",
+                (nomination_id,),
+            ).fetchone()
+            if saved is None and bound is not None:
+                saved = self.connection.execute(
+                    "SELECT * FROM transfer_confirmations WHERE transfer_id=?",
+                    (bound["transfer_id"],),
+                ).fetchone()
+
+            def current_facts() -> dict[str, Any]:
+                facts: dict[str, Any] = {
+                    "nomination": (
+                        None
+                        if nomination is None
+                        else {
+                            "nomination_id": nomination["nomination_id"],
+                            "state": nomination["state"],
+                            "revision": nomination["revision"],
+                            "allocated_quota_units": nomination["allocated_quota_units"],
+                        }
+                    ),
+                }
+                if bound is not None:
+                    facts["existing_transfer"] = {
+                        "transfer_id": bound["transfer_id"],
+                        "inventory_lot_id": bound["inventory_lot_id"],
+                        "state": bound["state"],
+                        "loaded_quota_units": bound["loaded_quota_units"],
+                    }
+                lot_row = self.connection.execute(
+                    "SELECT lot_id,available_quota_units,revision FROM inventory_lots WHERE lot_id=?",
+                    (lot_id,),
+                ).fetchone()
+                if lot_row is not None:
+                    facts["inventory_lot"] = {
+                        "lot_id": lot_row["lot_id"],
+                        "available_quota_units": lot_row["available_quota_units"],
+                        "revision": lot_row["revision"],
+                    }
+                return facts
+
+            # 内容完全一致的重试：原样返回首次确认的稳定结果，不再扣减、不写审计。
+            if saved is not None and saved["request_sha256"] == request_sha256:
+                replay = json.loads(saved["response_json"])
+                if confirmation_key is not None:
+                    replay["confirmation_key"] = confirmation_key
+                return replay
+
+            # 编号或依据不同：报告可读的业务冲突与当前事实，绝不暴露数据库唯一键异常。
+            if saved is not None:
+                existing_request = {
+                    "transfer_id": saved["transfer_id"],
+                    "nomination_id": saved["nomination_id"],
+                    "lot_id": saved["inventory_lot_id"],
+                    "expected_revision": saved["nomination_revision"],
+                }
+                differences = {
+                    key: {"首次确认": existing_request[key], "本次请求": request_body[key]}
+                    for key in existing_request
+                    if existing_request[key] != request_body[key]
+                }
+                if confirmation_key is not None and saved["confirmation_key"] == confirmation_key:
+                    message = "确认键对应的装载确认内容不同"
+                elif bound is not None and bound["transfer_id"] != transfer_id:
+                    message = "外输申请已被其他转运编号占用"
+                else:
+                    message = "转运编号已用于另一装载确认"
+                raise Conflict(
+                    message,
+                    {
+                        "differences": differences,
+                        "first_confirmation_key": saved["confirmation_key"],
+                        **current_facts(),
+                    },
+                )
+
+            # 无既有裁决：在同一事务内基于刚读取的申请、库存批次和修订号决定。
+            if nomination is None:
+                raise NotFound("外输申请不存在")
+            if bound is not None or nomination["state"] == "in_transit":
+                raise Conflict(
+                    "外输申请已进入在途状态，不能重复装载发运",
+                    current_facts(),
+                )
+            if nomination["state"] != "allocated":
+                raise InvalidState(
+                    f"外输申请当前状态为 {nomination['state']}，不是可交付版本",
+                    current_facts(),
+                )
+            if nomination["revision"] != expected_revision:
+                raise Conflict(
+                    "外输申请修订号已变化，装载确认依据的版本不是当前版本",
+                    {
+                        "expected_revision": expected_revision,
+                        **current_facts(),
+                    },
+                )
+            lot = self.connection.execute("SELECT * FROM inventory_lots WHERE lot_id=?", (lot_id,)).fetchone()
+            if lot is None:
+                raise NotFound("原油资源批次不存在")
+            if lot["facility_id"] != nomination["origin_id"] or lot["product"] != nomination["route_product"]:
+                raise Conflict(
+                    "原油资源批次与生产输送通道起点或资源类型不匹配",
+                    current_facts(),
+                )
+            allocated = Decimal(nomination["allocated_quota_units"])
+            available = Decimal(lot["available_quota_units"])
+            if available < allocated:
+                raise Conflict(
+                    "处理额度库存不足以完成分配",
+                    {"required_quota_units": decimal_text(allocated), **current_facts()},
+                )
+
+            expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
+            departed_at = self._now()
+            try:
+                lot_cursor = self.connection.execute(
+                    "UPDATE inventory_lots SET available_quota_units=?,revision=revision+1 "
+                    "WHERE lot_id=? AND revision=? AND available_quota_units=?",
+                    (
+                        decimal_text(quantize_volume(available - allocated)),
+                        lot_id,
+                        lot["revision"],
+                        decimal_text(available),
+                    ),
+                )
+                if lot_cursor.rowcount != 1:
+                    raise Conflict("原油资源批次已被其他确认改动，请依据当前修订号重试", current_facts())
+                nomination_cursor = self.connection.execute(
+                    "UPDATE nominations SET state='in_transit',revision=revision+1 "
+                    "WHERE nomination_id=? AND state='allocated' AND revision=?",
+                    (nomination_id, expected_revision),
+                )
+                if nomination_cursor.rowcount != 1:
+                    raise Conflict("外输申请状态已被其他操作改动，请重新读取后重试", current_facts())
+                cursor = self.connection.execute(
+                    "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_quota_units,"
+                    "expected_delivered_quota_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        transfer_id,
+                        nomination_id,
+                        lot_id,
+                        decimal_text(allocated),
+                        decimal_text(expected_delivery),
+                        departed_at,
+                        actor_id,
+                        departed_at,
+                    ),
+                )
+                transfer_row = self.connection.execute(
+                    "SELECT * FROM transfers WHERE rowid=?", (cursor.lastrowid,)
+                ).fetchone()
+                response = self._transfer_response(
+                    transfer_row, int(nomination["transit_hours"]), confirmation_key
+                )
+                self.connection.execute(
+                    "INSERT INTO transfer_confirmations(confirmation_key,request_sha256,transfer_id,"
+                    "nomination_id,nomination_revision,inventory_lot_id,lot_revision,loaded_quota_units,"
+                    "response_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        confirmation_key if confirmation_key is not None else f"transfer:{transfer_id}",
+                        request_sha256,
+                        transfer_id,
+                        nomination_id,
+                        expected_revision,
+                        lot_id,
+                        lot["revision"],
+                        decimal_text(allocated),
+                        canonical_json(response),
+                        actor_id,
+                        departed_at,
+                    ),
+                )
+                # 审计只记录真正生效的装载动作；任何冲突都会随事务回滚而不留记录。
+                self._audit(
+                    "transfer",
+                    transfer_id,
+                    "transfer.dispatched",
+                    actor_id,
+                    {
+                        "nomination_id": nomination_id,
+                        "nomination_revision": expected_revision,
+                        "inventory_lot_id": lot_id,
+                        "lot_revision": lot["revision"],
+                        "confirmation_key": confirmation_key,
+                    },
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("装载确认与已生效的转运冲突，请重新读取申请与库存后重试", current_facts()) from exc
+        return response
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")
