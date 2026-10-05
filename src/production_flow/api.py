@@ -87,7 +87,10 @@ class JsonApplication:
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if exc.details:
+                error["details"] = dict(exc.details)
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
